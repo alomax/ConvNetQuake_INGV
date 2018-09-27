@@ -1,0 +1,39 @@
+# install environment
+# https://www.tensorflow.org/install/install_mac
+sudo easy_install pip
+pip install --upgrade virtualenv 
+virtualenv --system-site-packages .
+source ./bin/activate
+easy_install -U pip
+pip install grpcio==1.9.1
+pip install https://storage.googleapis.com/tensorflow/mac/cpu/tensorflow-1.6.0-py2-none-any.whl
+pip install -r requirements.txt  # needed?
+pip install -r requirements2.txt  # needed?
+pip install python-gflags
+pip install -e git+https://github.com/gem/oq-hazardlib.git@589fa31ddca3697e6b167082136dc0174a77bc16#egg=openquake.hazardlib
+pip install dask --upgrade
+pip install argparse
+pip install geojson
+pip install geopy
+pip install folium
+
+
+ln -s /Users/anthony/opt/ConvNetQuake-master_tf1.0/bin cnqbin
+ln -s /Volumes/RAID_2TB_2015A/anthony_big_stuff/ConvNetQuake/data .
+ln -s /Users/anthony/opt/ConvNetQuake-master_tf1.0/quakenet .
+ln -s /Users/anthony/opt/ConvNetQuake-master_tf1.0/tflib .
+
+# convert code to TensorFlow 1.2
+# upgrade a whole directory of 0.n TensorFlow programs to 1.0, enter a command having the following format:
+$ python tf_upgrade.py --intree InputDir --outtree OutputDir
+#
+chmod a+x ./cnqbin/*/*.py
+
+
+# run codes
+source ./bin/activate
+export PYTHONPATH=./:./quakenet_ingv:/Users/anthony/opt/ConvNetQuake-master_tf1.0:$PYTHONPATH
+
+...
+
+see RUNNING_*.txt

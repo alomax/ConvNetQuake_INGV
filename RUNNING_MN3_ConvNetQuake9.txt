@@ -1,0 +1,45 @@
+#install
+see INSTALLATION.txt
+
+# activate environment
+source ./bin/activate; export PYTHONPATH=./:./quakenet_ingv
+#:/Users/anthony/opt/ConvNetQuake-master_tf1.0:$PYTHONPATH
+
+
+# get channel_file
+http://webservices.ingv.it/fdsnws/station/1/query?network=MN&channel=BH?&starttime=2009-01-01&endtime=2018-12-31&level=channel 
+# save as: data/MN/MN_stations_2009-2018.xml
+
+# get train and validation events for circular distances centred on each station in channel_file
+python quakenet_ingv/bin/preprocess/get_events.py --base_url IRIS --channel_file data/MN/MN_stations_2009-2018.xml --starttime 2010-01-01 --endtime 2018-12-31 --channel_prefix BH --sampling_rate 20 --minradius 0.0 --maxradius 2.0 --minmagnitude 3.0 --event_files_path output/MN3/events
+python quakenet_ingv/bin/preprocess/get_events.py --base_url IRIS --channel_file data/MN/MN_stations_2009-2018.xml --starttime 2010-01-01 --endtime 2018-12-31 --channel_prefix BH --sampling_rate 20 --minradius 2.0 --maxradius 20.0 --minmagnitude 4.0 --event_files_path output/MN3/events
+python quakenet_ingv/bin/preprocess/get_events.py --base_url IRIS --channel_file data/MN/MN_stations_2009-2018.xml --starttime 2010-01-01 --endtime 2018-12-31 --channel_prefix BH --sampling_rate 20 --minradius 20.0 --maxradius 70.0 --minmagnitude 5.0 --event_files_path output/MN3/events
+python quakenet_ingv/bin/preprocess/get_events.py --base_url IRIS --channel_file data/MN/MN_stations_2009-2018.xml --starttime 2010-01-01 --endtime 2018-12-31 --channel_prefix BH --sampling_rate 20 --minradius 70.0 --maxradius 180.0 --minmagnitude 6.0 --event_files_path output/MN3/events
+
+python quakenet_ingv/bin/preprocess/get_streams.py --event_files_path output/MN3/events --outpath output/MN3/streams --base_url INGV --channel_file data/MN/MN_stations_2009-2018.xml --channel_prefix BH --sampling_rate 20 --n_streams 5000 --noise_fraction 0.4 --validation_fraction 0.1 --test_fraction 0.0 --snr_accept 3.0 --window_length 50 --window_start 5 --n_distances 50 --n_magnitudes 20 --n_depths 20 --n_azimuths 36 --event_fraction 0.25
+
+#train
+quakenet_ingv/bin/train --outpath output/MN3/streams --dataset output/MN3/streams/train --model ConvNetQuake9 --checkpoint_dir output/MN3/ConvNetQuake9 --use_magnitudes --use_depths --use_azimuths
+tensorboard --logdir output/MN3/ConvNetQuake9/ConvNetQuake9
+quakenet_ingv/bin/evaluate --outpath output/MN3/streams --model ConvNetQuake9 --checkpoint_dir output/MN3/ConvNetQuake9/ConvNetQuake9 --dataset output/MN3/streams/validate --eval_interval -1 --use_magnitudes --use_depths --use_azimuths --events
+
+
+# get test events for circular distances centred on each station in channel_file
+python quakenet_ingv/bin/preprocess/get_events.py --base_url IRIS --channel_file data/MN/MN_stations_2009-2018.xml --starttime 2007-01-01 --endtime 2009-12-31 --channel_prefix BH --sampling_rate 20 --minradius 0.0 --maxradius 2.0 --minmagnitude 4.0 --event_files_path output/MN/test_events
+python quakenet_ingv/bin/preprocess/get_events.py --base_url IRIS --channel_file data/MN/MN_stations_2009-2018.xml --starttime 2007-01-01 --endtime 2009-12-31 --channel_prefix BH --sampling_rate 20 --minradius 2.0 --maxradius 20.0 --minmagnitude 5.0 --event_files_path output/MN/test_events
+python quakenet_ingv/bin/preprocess/get_events.py --base_url IRIS --channel_file data/MN/MN_stations_2009-2018.xml --starttime 2007-01-01 --endtime 2009-12-31 --channel_prefix BH --sampling_rate 20 --minradius 20.0 --maxradius 50.0 --minmagnitude 6.0 --event_files_path output/MN/test_events
+python quakenet_ingv/bin/preprocess/get_events.py --base_url IRIS --channel_file data/MN/MN_stations_2009-2018.xml --starttime 2007-01-01 --endtime 2009-12-31 --channel_prefix BH --sampling_rate 20 --minradius 50.0 --maxradius 180.0 --minmagnitude 6.5 --event_files_path output/MN/test_events
+#
+python quakenet_ingv/bin/preprocess/get_streams.py --event_files_path output/MN/test_events --outpath output/MN3/test_streams --base_url INGV --channel_file data/MN/MN_stations_2009-2018.xml --channel_prefix BH --sampling_rate 20 --n_streams 999 --noise_fraction 0.0 --validation_fraction 0.0 --test_fraction 1.0 --snr_accept -1.0 --window_length 50 --window_start 5 --n_distances 50 --n_magnitudes 20 --n_depths 20 --n_azimuths 36 --systematic
+#
+quakenet_ingv/bin/evaluate --outpath output/MN3/test_streams --model ConvNetQuake9 --checkpoint_dir output/MN3/ConvNetQuake9/ConvNetQuake9_NNN --dataset output/MN3/test_streams_YEARS/test --eval_interval -1 --use_magnitudes --use_depths --use_azimuths --channel_file data/MN/MN_stations_2007-2018.xml --events --save_event_results --step NNN
+# NOTE: move event_results to event_results_YEARS
+#
+./run_event_results_batch.bash output/MN3/ConvNetQuake9/ConvNetQuake9_NNN/event_results_YEARS
+
+quakenet_ingv/bin/plot_events --event_files_path output/MN3/streams/train/events/xml --channel_file data/MN/MN_stations_2007-2018.xml --channel_prefix BH --sampling_rate 20 --n_magnitudes 20 --n_depths 20
+quakenet_ingv/bin/plot_events --event_files_path output/MN3/test_streams_2009/test/events/xml --channel_file data/MN/MN_stations_2007-2018.xml --channel_prefix BH --sampling_rate 20 --n_magnitudes 20 --n_depths 20
+
+quakenet_ingv/bin/plot_event_stats --evaluate_event_results_path output/MN3/ConvNetQuake9/ConvNetQuake9_NNN/event_results_YEARS --train_events_path output/MN3/streams/train/events/xml
+
+
