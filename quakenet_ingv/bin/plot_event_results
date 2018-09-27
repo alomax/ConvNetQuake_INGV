@@ -1,0 +1,365 @@
+#!/usr/bin/env python
+# encoding: utf-8
+# -------------------------------------------------------------------
+# File:  plot_event_results
+# Author: Anthony Lomax <anthony@alomax.net>
+# Created: 2018-05-09
+# ------------------------------------------------------------------#
+
+""" Plot event results on an interactive map"""
+
+# import sys
+import argparse
+import os
+# import shutil
+# import time
+import cPickle as pickle
+
+import math
+# 
+# import numpy as np
+# import skimage
+# import skimage.io
+# import skimage.transform
+# import tensorflow as tf
+# from sklearn.metrics import confusion_matrix
+import geopy
+from geopy.distance import distance
+from geopy.distance import EARTH_RADIUS
+from geojson import Polygon
+
+import obspy.geodetics.base as geo
+
+from obspy.core import UTCDateTime
+from obspy.core import event
+from obspy import read_inventory
+
+import json
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import folium
+#from folium.plugins import MarkerCluster
+
+import quakenet.util as util
+import quakenet.plot as qnplot
+
+PROB_CUTOFF = 0.01
+PROB_CUTOFF_STATS = 0.01
+DIST_STEP_REF = 0.1 # deg
+AZ_STEP_REF = 1.0 # deg at 90 deg
+
+DEG2KM = math.pi * EARTH_RADIUS / 180.0
+
+def get_great_cicle_path(sta_coordinates, distance0, azimuth0):
+    
+    origin = geopy.Point(sta_coordinates['latitude'], sta_coordinates['longitude'])
+    
+    num_dist = 2 + int((distance0) / DIST_STEP_REF)
+    dist_step = distance0 / float(num_dist)
+    
+    great_circle = []
+    dist = dist_step
+    destination = distance(kilometers=dist * DEG2KM).destination(origin, azimuth0)
+    last_longitude = destination.longitude
+    while dist < distance0 + dist_step / 2.0:
+        destination = distance(kilometers=dist * DEG2KM).destination(origin, azimuth0)
+        corrected_longitude = destination.longitude \
+            if math.fabs(destination.longitude - last_longitude) < 180.0 \
+            else destination.longitude - 360.0 if destination.longitude > 0.0 else destination.longitude + 360.0
+        great_circle.append([destination.latitude, corrected_longitude])
+        dist += dist_step
+        
+    return great_circle
+        
+        
+def get_polygon(sta_coordinates, distance0, distance1, azimuth0, azimuth1):
+    
+    origin = geopy.Point(sta_coordinates['latitude'], sta_coordinates['longitude'])
+    
+    num_dist = 2 + int((distance1 - distance0) / DIST_STEP_REF)
+    dist_step = (distance1 - distance0) / float(num_dist)
+    num_az = 2 + int((distance0 / 90.0) * (azimuth1 - azimuth0) / AZ_STEP_REF)
+    az_step = (azimuth1 - azimuth0) / float(num_az)
+    
+    polygon = []
+    # start at lower left corner
+    dist = distance0
+    az = azimuth0
+    destination = distance(kilometers=dist * DEG2KM).destination(origin, az)
+    last_longitude = destination.longitude
+    # move CCW from lower left to lower right
+    while az < azimuth1 + az_step / 2.0:
+        destination = distance(kilometers=dist * DEG2KM).destination(origin, az)
+        corrected_longitude = destination.longitude \
+            if math.fabs(destination.longitude - last_longitude) < 180.0 \
+            else destination.longitude - 360.0 if destination.longitude > 0.0 else destination.longitude + 360.0
+        polygon.append(tuple([round(corrected_longitude, 3), round(destination.latitude, 3)]))
+        az += az_step
+    # lower right corner
+    az = azimuth1
+    # move CCW from lower right to upper right
+    while dist < distance1 + dist_step / 2.0:
+        destination = distance(kilometers=dist * DEG2KM).destination(origin, az)
+        corrected_longitude = destination.longitude \
+            if math.fabs(destination.longitude - last_longitude) < 180.0 \
+            else destination.longitude - 360.0 if destination.longitude > 0.0 else destination.longitude + 360.0
+        polygon.append(tuple([round(corrected_longitude, 3), round(destination.latitude, 3)]))
+        dist += dist_step
+    # upper right corner
+    dist = distance1
+    # move CCW from upper right to upper left
+    while az > azimuth0 - az_step / 2.0:
+        destination = distance(kilometers=dist * DEG2KM).destination(origin, az)
+        corrected_longitude = destination.longitude \
+            if math.fabs(destination.longitude - last_longitude) < 180.0 \
+            else destination.longitude - 360.0 if destination.longitude > 0.0 else destination.longitude + 360.0
+        polygon.append(tuple([round(corrected_longitude, 3), round(destination.latitude, 3)]))
+        az -= az_step
+    # upper right corner
+    az = azimuth0
+    # move CCW from lower right to upper right
+    while dist > distance0 - dist_step / 2.0:
+        destination = distance(kilometers=dist * DEG2KM).destination(origin, az)
+        corrected_longitude = destination.longitude \
+            if math.fabs(destination.longitude - last_longitude) < 180.0 \
+            else destination.longitude - 360.0 if destination.longitude > 0.0 else destination.longitude + 360.0
+        polygon.append(tuple([round(corrected_longitude, 3), round(destination.latitude, 3)]))
+        dist -= dist_step
+    # close with lower left corner
+    dist = distance0
+    destination = distance(kilometers=dist * DEG2KM).destination(origin, az)
+    corrected_longitude = destination.longitude \
+        if math.fabs(destination.longitude - last_longitude) < 180.0 \
+        else destination.longitude - 360.0 if destination.longitude > 0.0 else destination.longitude + 360.0
+    polygon.append(tuple([round(corrected_longitude, 3), round(destination.latitude, 3)]))
+    
+    # get polygon center
+    az = (azimuth0 + azimuth1) / 2.0
+    dist = (distance0 + distance1) / 2.0
+    center_destination = distance(kilometers=dist * DEG2KM).destination(origin, az)
+
+    #print 'polygon', polygon
+    return Polygon([polygon]), center_destination.latitude, center_destination.longitude
+
+
+
+
+def main(args):
+    
+    # get event file
+    event_xml_file = None
+    for root, dirs, files in os.walk(args.eventpath):
+        for f in files:
+            if f.endswith('.event.xml'):
+                event_xml_file = f
+                break
+    if event_xml_file == None:
+        return
+        
+    event_root_name = event_xml_file.replace('.event.xml', '')
+    catalog = event.read_events(os.path.join(args.eventpath, event_xml_file))
+    evt = catalog[0]
+    origin = evt.preferred_origin()
+    print 'evt', evt
+    event_preferred_magnitude = evt.preferred_magnitude().mag
+    print 'event_preferred_magnitude', event_preferred_magnitude
+    origin_str = 'M=' + str(event_preferred_magnitude) + ' ' + evt.event_descriptions[0].text + '\n'
+    origin_str += '   '+ origin.time.isoformat()  + '\n'
+    origin_str += '   '+ 'Lat:' + str(origin.latitude) + ' Lon:' + str(origin.longitude) + ' Depth:' + str(origin.depth / 1000.0) + 'km' + '\n'
+    print origin_str
+    origin_str_line = origin_str.replace('\n', '  ')
+    with open(os.path.join(args.eventpath, event_root_name + '.txt'), 'w') as file:
+        file.write(origin_str_line)
+        file.write('\n')
+        
+
+    # get channel files
+    sta_probs_files = []
+    for root, dirs, files in os.walk(args.eventpath):
+        for f in files:
+            if f.endswith('.probs.pkl'):
+                sta_probs_files.append(f)
+    num_sta_probs = len(sta_probs_files)
+    
+    event_prob_magnitude = []
+    event_prob_depth = []
+    
+    epi_sta_poly_coords = []
+    
+    distance_error_sum = 0.0
+    tot_prob_sum = 0.0
+    distance_sum = 0.0
+    tot_sta_sum = 0.0
+    
+    sta_feature_groups = []
+    feature_group_gc_lines = folium.map.FeatureGroup(name='sta great-circles', overlay=True, control=True)
+    
+    # process each channel, build probability feature polygons
+    for sta_prob_file in sta_probs_files:
+        
+        sta_root_name = sta_prob_file.replace('.probs.pkl', '')
+        print sta_root_name
+        # 2009-01-06T16-09-06.750.MN.DIVS..BHZ.probs.pkl
+        
+        event_date, dsec, net, sta, loc, chan = sta_root_name.split('.')
+        seed_id = net + '.' + sta + '.' + loc + '.' + chan
+        
+        feature_group = folium.map.FeatureGroup(name=seed_id, overlay=True, control=True)
+        
+        # get station coordinates
+        sta_xml_file = os.path.join(args.eventpath, sta_root_name + '.station.xml')
+        inventory = read_inventory(sta_xml_file)
+        sta_coordinates = inventory.get_coordinates(seed_id, UTCDateTime(event_date))
+        #print '   ', seed_id, sta_coordinates['latitude'], sta_coordinates['longitude'], sta_coordinates['elevation'], sta_coordinates['local_depth']
+        
+        marker = folium.CircleMarker([sta_coordinates['latitude'], sta_coordinates['longitude']], \
+                                              radius=5, popup=seed_id, stroke=True, weight=5, color='green')
+        feature_group.add_child(marker)
+
+                
+        # get probabilities
+        with open(os.path.join(args.eventpath, sta_prob_file), 'r') as file:
+            stream_params = pickle.load(file)
+            pred_prob_distance = pickle.load(file)
+            pred_prob_magnitude = pickle.load(file)
+            pred_prob_depth = pickle.load(file)
+            pred_prob_azimuth = pickle.load(file)
+
+        print '   ', 'n_distance', stream_params.n_distances, len(pred_prob_distance), \
+        'n_magnitudes', stream_params.n_magnitudes, len(pred_prob_magnitude), \
+        'n_depths', stream_params.n_depths, len(pred_prob_depth), \
+        'n_azimuths', stream_params.n_azimuths, len(pred_prob_azimuth)
+
+        dist_az_prob_accepted = False
+        
+        for ndist in range(1, len(pred_prob_distance)):
+            distance0 = util.classification2distance(ndist - 1, len(pred_prob_distance))
+            distance1 = util.classification2distance(ndist - 1 + 1, len(pred_prob_distance))
+            dist_prob = pred_prob_distance[ndist]
+            #print '   ', '   ', 'dist:', ndist, distance, dist_prob
+            for naz in range(len(pred_prob_azimuth)):
+                az_prob = pred_prob_azimuth[naz]
+                tot_prob = dist_prob * az_prob
+                # plot if total prob high enough
+                if tot_prob >= PROB_CUTOFF:
+                    dist_az_prob_accepted = True
+                    azimuth0 = util.classification2azimuth(naz, len(pred_prob_azimuth))
+                    azimuth1 = util.classification2azimuth(naz + 1, len(pred_prob_azimuth))
+                    opacity = float(tot_prob)
+                    # line from epicenter to center of polygon
+                    line_opacity = min(opacity, 0.8)
+                    line_opacity = max(line_opacity, 0.1)
+                    great_cicle_path = get_great_cicle_path(sta_coordinates, distance0 , (azimuth0 + azimuth1) / 2.0)
+                    polyline = folium.PolyLine(great_cicle_path, color='#888888', weight=2, opacity=line_opacity)
+                    feature_group_gc_lines.add_child(polyline)
+                    # dist-az geographic polygon
+                    polygon, lat_cent, lon_cent = get_polygon(sta_coordinates, distance0, distance1, azimuth0, azimuth1)
+                    geo_json = folium.GeoJson(polygon,
+                                        style_function=lambda feature, opacity=opacity: {
+                                                                                        'weight': 0,
+                                                                                        'fillColor': 'blue',
+                                                                                        'fillOpacity': opacity
+                                                                                    })
+                    feature_group.add_child(geo_json)
+                # calc stats if total prob high enough
+                if tot_prob >= PROB_CUTOFF_STATS:
+                    # accumulate epicenter, station and polygon coordinates
+                    coords = (origin.latitude, origin.longitude, origin.depth / 1000.0, 
+                                 seed_id, sta_coordinates['latitude'], sta_coordinates['longitude'], 
+                                 lat_cent, lon_cent, tot_prob)
+                    epi_sta_poly_coords.append(coords)
+                    # accumulate mean epicenter station stats
+                    dist_meters, azim, bazim = geo.gps2dist_azimuth(origin.latitude, origin.longitude, lat_cent, lon_cent)
+                    distance_error = geo.kilometer2degrees(dist_meters / 1000.0, radius=6371)
+                    distance_error_sum += distance_error * tot_prob
+                    tot_prob_sum += tot_prob
+                    
+        dist_meters, azim, bazim = geo.gps2dist_azimuth(origin.latitude, origin.longitude, sta_coordinates['latitude'], sta_coordinates['longitude'])
+        dist = geo.kilometer2degrees(dist_meters / 1000.0, radius=6371)
+        distance_sum += dist
+        tot_sta_sum += 1
+                    
+        sta_feature_groups.append(feature_group)
+        # only use magnitude and depth probs if at least one dist-az bin had tot_prob >= PROB_CUTOFF
+        if dist_az_prob_accepted:
+            event_prob_magnitude.append(pred_prob_magnitude)
+            event_prob_depth.append(pred_prob_depth)
+
+    # save epicenter, station stats
+    mean_distance_error = 0.0
+    if tot_prob_sum > 0.0:
+        mean_distance_error= distance_error_sum / tot_prob_sum
+    mean_sta_epi_distance = 0.0
+    if tot_sta_sum > 0:
+        mean_sta_epi_distance = distance_sum / float(tot_sta_sum)
+    epi_sta_stats = (origin.latitude, origin.longitude, origin.depth / 1000.0, mean_distance_error, tot_prob_sum, mean_sta_epi_distance, tot_sta_sum)
+    filename = os.path.join(args.eventpath,  event_root_name + '.epi_sta_stats.pkl')
+    with open(filename, 'w') as file:
+        file.write(pickle.dumps(epi_sta_stats)) # use `pickle.loads` to do the reverse
+        
+    # plot
+    zoom_start = 4
+    location = [origin.latitude, origin.longitude]
+    if mean_sta_epi_distance > 90.0:
+        zoom_start = 0
+        location = [0.0, 0.0]
+    elif mean_sta_epi_distance > 60.0:
+        zoom_start = 1
+        location = [0.0, 0.0]
+    elif mean_sta_epi_distance > 40.0:
+        zoom_start = 2
+    elif mean_sta_epi_distance > 20.0:
+        zoom_start = 3
+    folium_map = folium.Map(tiles='CartoDB positron', \
+                            prefer_canvas=True, control_scale=True, zoom_start = zoom_start, location=location)
+    lower_left = [-90, -180]
+    upper_right =  [90, 180]
+
+    feature_group = folium.map.FeatureGroup(name=event_root_name, overlay=True, control=True)
+    folium_map.add_child(feature_group)
+
+    folium_map.add_child(feature_group_gc_lines)
+    for feature_group in sta_feature_groups:
+        folium_map.add_child(feature_group)
+            
+    #marker = folium.features.Marker([origin.latitude, origin.longitude], \
+    #                                          icon=folium.Icon(prefix='fa', icon='fa-star', color='red'), popup=origin_str)
+    marker = folium.CircleMarker([origin.latitude, origin.longitude], \
+                                          radius=10, popup=origin_str, stroke=True, weight=6, color='red')
+    feature_group.add_child(marker)
+
+    folium.LayerControl().add_to(folium_map)
+    htmlfile = event_root_name + '.html'
+    folium_map.save(os.path.join(args.eventpath, htmlfile))
+    print 'HTML output written to'
+    print htmlfile
+    
+    
+    # magnitude bar chart
+    v_axis_direction = -1
+    qnplot.write_bar_chart_html('Magnitude', '', "Relative probability", event_preferred_magnitude, os.path.join(args.eventpath, event_root_name + '.magnitude.html'), \
+                         event_prob_magnitude, PROB_CUTOFF, util.classification2magnitude,
+                         v_axis_direction)
+    
+    # depth bar chart
+    v_axis_direction = 1
+    qnplot.write_bar_chart_html('Depth', '(km)', "Relative probability", origin.depth / 1000.0, os.path.join(args.eventpath, event_root_name + '.depth.html'), \
+                         event_prob_depth, PROB_CUTOFF, util.classification2depth,
+                         v_axis_direction)
+    
+    # save epicenter, station and polygon coordinates list
+    filename = os.path.join(args.eventpath,  event_root_name + '.epi_sta_poly.pkl')
+    with open(filename, 'w') as file:
+        file.write(pickle.dumps(epi_sta_poly_coords)) # use `pickle.loads` to do the reverse
+    
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--eventpath', type=str, 
+                        help='Path for event input')
+    
+    args = parser.parse_args()
+    main(args)

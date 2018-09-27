@@ -1,0 +1,145 @@
+#!/usr/bin/env python
+# encoding: utf-8
+# -------------------------------------------------------------------
+# File:    train.py
+# Author:  Michael Gharbi <gharbi@mit.edu>
+# Created: 2016-10-25
+# -------------------------------------------------------------------
+# 
+# 
+# 
+# ------------------------------------------------------------------#
+"""Train a model."""
+
+import argparse
+import os
+import cPickle as pickle
+
+import tensorflow as tf
+import setproctitle
+
+import quakenet.models as models
+import quakenet.data_pipeline as dp
+import quakenet.config as config
+
+
+def main(args):
+    setproctitle.setproctitle('quakenet')
+    
+    tf.set_random_seed(1234)
+    
+    # get streams parameters
+    with open(os.path.join(args.outpath, 'params.pkl'), 'r') as file:
+        stream_params = pickle.load(file)
+
+
+    n_distances = stream_params.n_distances
+
+    if args.use_magnitudes:
+        n_magnitudes = stream_params.n_magnitudes
+    else:
+        n_magnitudes = 0
+
+    if args.use_depths:
+        n_depths = stream_params.n_depths
+    else:
+        n_depths = 0
+
+    if args.use_azimuths:
+        n_azimuths = stream_params.n_azimuths
+    else:
+        n_azimuths = 0
+
+    cfg = config.Config()
+    cfg.batch_size = args.batch_size
+    cfg.regularization = args.regularization
+    
+    cfg.n_distances = n_distances
+    cfg.n_distances += 1
+    cfg.add = 1
+    
+    cfg.n_magnitudes = n_magnitudes
+    cfg.n_depths = n_depths
+    cfg.n_azimuths = n_azimuths
+
+    cfg.unique_station = args.unique_station
+    
+    pos_path = os.path.join(args.dataset,"events")
+    neg_path = os.path.join(args.dataset,"noise")
+    
+    # data pipeline for positive and negative examples
+    pos_pipeline = dp.DataPipeline(pos_path, cfg, True)
+    neg_pipeline = dp.DataPipeline(neg_path, cfg, True)
+    
+    pos_samples = {
+        'data': pos_pipeline.samples,
+        'stream_max': pos_pipeline.stream_max,
+        'distance_id': pos_pipeline.distance_id,
+        'magnitude_id': pos_pipeline.magnitude_id,
+        'depth_id': pos_pipeline.depth_id,
+        'azimuth_id': pos_pipeline.azimuth_id
+      }
+    neg_samples = {
+        'data': neg_pipeline.samples,
+        'stream_max': neg_pipeline.stream_max,
+        'distance_id': neg_pipeline.distance_id,
+        'magnitude_id': neg_pipeline.magnitude_id,
+        'depth_id': neg_pipeline.depth_id,
+        'azimuth_id': neg_pipeline.azimuth_id
+      }
+
+    # 20180319 AJL - Fix to support later tensorflow versions (e.g. 1.6.0)
+    #  samples = {
+    #    "data": tf.concat(0,[pos_samples["data"],neg_samples["data"]]),
+    #    "distance_id" : tf.concat(0,[pos_samples["distance_id"],neg_samples["distance_id"]])
+    #    }
+    samples = {
+        "data": tf.concat([pos_samples["data"],neg_samples["data"]], 0),
+        "stream_max": tf.concat([pos_samples["stream_max"],neg_samples["stream_max"]], 0),
+        "distance_id" : tf.concat([pos_samples["distance_id"],neg_samples["distance_id"]], 0),
+        "magnitude_id" : tf.concat([pos_samples["magnitude_id"],neg_samples["magnitude_id"]], 0),
+        "depth_id" : tf.concat([pos_samples["depth_id"],neg_samples["depth_id"]], 0),
+        "azimuth_id" : tf.concat([pos_samples["azimuth_id"],neg_samples["azimuth_id"]], 0)
+        }
+    
+    # 20180521 AJL
+    # slice data to requested number of points
+    if args.ndatapoints > 0:
+        samples['data'] = samples['data'][ : , 0:args.ndatapoints]
+
+    # model
+    model = models.get(args.model, samples, cfg, args.checkpoint_dir, is_training=True)
+
+    # train loop
+    model.train(
+        args.learning_rate,
+        resume=args.resume,
+        profiling=args.profiling,
+        summary_step=10) 
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default='ConvNetQuake')
+    parser.add_argument('--outpath', type=str, help='Path for stream output')
+    parser.add_argument('--checkpoint_dir', type=str, default='output/checkpoints')
+    parser.add_argument('--dataset', type=str, default='data/hackathon/train')
+    parser.add_argument('--unique_station', type=str, default=None)
+    parser.add_argument('--ndatapoints', type=int, default=-1)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--regularization', type=float, default=1e-3)
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--resume', action='store_true')
+    parser.set_defaults(resume=False)
+    parser.add_argument('--profiling', action='store_true')
+    parser.add_argument('--use_magnitudes', action='store_true')
+    parser.set_defaults(use_magnitudes=False)
+    parser.add_argument('--use_depths', action='store_true')
+    parser.set_defaults(use_depths=False)
+    parser.add_argument('--use_azimuths', action='store_true')
+    parser.set_defaults(use_azimuths=False)
+    parser.set_defaults(profiling=False)
+    args = parser.parse_args()
+    
+    args.checkpoint_dir = os.path.join(args.checkpoint_dir, args.model)
+    
+    main(args)

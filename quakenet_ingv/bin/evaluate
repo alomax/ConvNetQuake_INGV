@@ -1,0 +1,469 @@
+#!/usr/bin/env python
+# encoding: utf-8
+# Created: 2016-10-25
+# -------------------------------------------------------------------
+# File:  evaluate
+# Author: Thibaut Perol <tperol@g.harvard.edu>
+# Created: 2016-11-16
+# ------------------------------------------------------------------#
+
+""" Test a model on tfrecords"""
+
+import sys
+import argparse
+import os
+import shutil
+import time
+import json
+import pandas as pd
+import cPickle as pickle
+
+import numpy as np
+import skimage
+import skimage.io
+import skimage.transform
+import tensorflow as tf
+from sklearn.metrics import confusion_matrix
+from obspy.core import UTCDateTime
+from obspy.core import event
+from obspy import read_inventory
+
+import quakenet.util as util
+import quakenet.models as models
+from quakenet.data_pipeline import DataPipeline
+import quakenet.config as config
+
+
+def main(args):
+    
+    # get streams parameters
+    with open(os.path.join(args.outpath, 'params.pkl'), 'r') as file:
+        stream_params = pickle.load(file)
+
+
+    n_distances = stream_params.n_distances
+
+    if args.use_magnitudes:
+        n_magnitudes = stream_params.n_magnitudes
+    else:
+        n_magnitudes = 0
+
+    if args.use_depths:
+        n_depths = stream_params.n_depths
+    else:
+        n_depths = 0
+
+    if args.use_azimuths:
+        n_azimuths = stream_params.n_azimuths
+    else:
+        n_azimuths = 0
+
+
+    if not args.noise and not args.events:
+        raise ValueError('Define if evaluating accuracy on noise or events')
+
+    if args.noise and args.events:
+        raise ValueError('Define if evaluating accuracy on either noise or events')
+
+
+    # Directory in which the evaluation summaries are written
+    if args.noise:
+        summary_dir =  os.path.join(args.checkpoint_dir,'noise')
+    elif args.events:
+        summary_dir =  os.path.join(args.checkpoint_dir,'events')
+        
+    if args.save_false:
+        false_start = []
+        false_end = []
+        false_origintime =[]
+        false_dir = os.path.join('output','false_predictions')
+        if not os.path.exists(false_dir):
+            os.makedirs(false_dir)
+
+    while True:
+        ckpt = tf.train.get_checkpoint_state(args.checkpoint_dir)
+        if args.eval_interval < 0 or ckpt:
+            print 'Evaluating model'
+            break
+        print  'Waiting for training job to save a checkpoint'
+        time.sleep(args.eval_interval)
+
+    cfg = config.Config()
+    if args.noise:
+        cfg.batch_size = 256
+    if args.events:
+        cfg.batch_size = 1
+    if args.save_false:
+        cfg.batch_size = 1
+    cfg.n_epochs = 1
+    
+    cfg.n_distances = n_distances
+    cfg.n_distances += 1
+    cfg.add = 1
+    
+    cfg.n_magnitudes = n_magnitudes
+    cfg.n_depths = n_depths
+    cfg.n_azimuths = n_azimuths
+    
+    cfg.unique_station = args.unique_station
+    
+    # read list of channels to use
+    inventory_full = read_inventory(args.channel_file)
+
+    while True:
+        try:
+            # data pipeline
+            data_pipeline = DataPipeline(args.dataset, config=cfg, is_training=False)
+            samples = {
+                'name': data_pipeline.names,
+                'data': data_pipeline.samples,
+                'stream_max': data_pipeline.stream_max,
+                'distance_id': data_pipeline.distance_id,
+                'magnitude_id': data_pipeline.magnitude_id,
+                'depth_id': data_pipeline.depth_id,
+                'azimuth_id': data_pipeline.azimuth_id,
+                'start_time': data_pipeline.start_time,
+                'end_time': data_pipeline.end_time,
+                'distance': data_pipeline.distance,
+                'magnitude': data_pipeline.magnitude,
+                'depth': data_pipeline.depth,
+                'azimuth': data_pipeline.azimuth
+                }
+
+            # 20180521 AJL
+            # slice data to requested number of points
+            if args.ndatapoints > 0:
+                samples['data'] = samples['data'][ : , 0:args.ndatapoints]
+
+            # set up model and validation metrics
+            model = models.get(args.model, samples, cfg,
+                               args.checkpoint_dir, 
+                               is_training=False)
+            metrics = model.validation_metrics()
+            # Validation summary writer
+            # 20180417 AJL  summary_writer = tf.train.SummaryWriter(summary_dir, None)
+            summary_writer = tf.summary.FileWriter(summary_dir, None)
+
+            with tf.Session() as sess:
+                coord = tf.train.Coordinator()
+                tf.initialize_local_variables().run()
+                threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+
+                model.load(sess, args.step)
+                print  'Evaluating at step {}'.format(sess.run(model.global_step))
+
+                step = tf.train.global_step(sess, model.global_step)
+                mean_metrics = {}
+                for key in metrics:
+                    mean_metrics[key] = 0
+
+                # open results to file
+                evaluate_results_file_name =  os.path.join(args.checkpoint_dir,'evaluate_results.txt')
+                evaluate_results_file = open(evaluate_results_file_name,'w') 
+
+                if args.save_event_results:
+                    event_results_dirname = os.path.join(args.checkpoint_dir, 'event_results')
+                    if not os.path.exists(event_results_dirname):
+                        os.makedirs(event_results_dirname)
+               
+                n_metrics = 0
+                pred_labels_distance = np.empty(1)
+                true_labels_distance = np.empty(1)
+                pred_labels_magnitude = np.empty(1)
+                true_labels_magnitude = np.empty(1)
+                pred_labels_depth = np.empty(1)
+                true_labels_depth = np.empty(1)
+                pred_labels_azimuth = np.empty(1)
+                true_labels_azimuth = np.empty(1)
+                while True:
+                    try:
+                        to_fetch  = [metrics,
+                                     samples['name'],
+                                     model.layers['distance_logits'],
+                                     model.layers['distance_prob'],
+                                     model.layers['distance_prediction'],
+                                     samples['distance_id'],
+                                     samples['distance'],
+                                     model.layers['magnitude_logits'],
+                                     model.layers['magnitude_prob'],
+                                     model.layers['magnitude_prediction'],
+                                     samples['magnitude_id'],
+                                     samples['magnitude'],
+                                     model.layers['depth_logits'],
+                                     model.layers['depth_prob'],
+                                     model.layers['depth_prediction'],
+                                     samples['depth_id'],
+                                     samples['depth'],
+                                     model.layers['azimuth_logits'],
+                                     model.layers['azimuth_prob'],
+                                     model.layers['azimuth_prediction'],
+                                     samples['azimuth_id'],
+                                     samples['azimuth'],
+                                     samples['start_time'],
+                                     samples['end_time']
+                                     ]
+                        metrics_, \
+                            batch_names, \
+                            batch_pred_logits_distance, batch_pred_prob_distance, batch_pred_label_distance, batch_true_label_distance, batch_true_distance, \
+                            batch_pred_logits_magnitude, batch_pred_prob_magnitude, batch_pred_label_magnitude, batch_true_label_magnitude, batch_true_magnitude, \
+                            batch_pred_logits_depth, batch_pred_prob_depth, batch_pred_label_depth, batch_true_label_depth, batch_true_depth, \
+                            batch_pred_logits_azimuth, batch_pred_prob_azimuth, batch_pred_label_azimuth, batch_true_label_azimuth, batch_true_azimuth, \
+                            starttime, endtime = sess.run(to_fetch)
+
+                        batch_pred_label_distance -=1 
+                        pred_labels_distance = np.append(pred_labels_distance, batch_pred_label_distance)
+                        true_labels_distance = np.append(true_labels_distance, batch_true_label_distance)
+
+                        pred_labels_magnitude = np.append(pred_labels_magnitude, batch_pred_label_magnitude)
+                        true_labels_magnitude = np.append(true_labels_magnitude, batch_true_label_magnitude)
+
+                        pred_labels_depth = np.append(pred_labels_depth, batch_pred_label_depth)
+                        true_labels_depth = np.append(true_labels_depth, batch_true_label_depth)
+
+                        pred_labels_azimuth = np.append(pred_labels_azimuth, batch_pred_label_azimuth)
+                        true_labels_azimuth = np.append(true_labels_azimuth, batch_true_label_azimuth)
+
+                        # Save times of false preds
+                        if args.save_false and \
+                                batch_pred_label_distance != batch_true_label_distance:
+                            print '---False prediction---'
+                            print UTCDateTime(starttime), UTCDateTime(endtime)
+                            false_origintime.append((starttime[0]+endtime[0])/2)
+                            false_end.append(UTCDateTime(endtime))
+                            false_start.append(UTCDateTime(starttime))
+
+                        # print  results to file
+                        for n in range(len(batch_names)):
+                            mag = -999.0
+                            depth = -999.0
+                            azimuth = -999.0
+                            vsum = 0.0
+                            wt = 0.0
+                            for m in range(len(batch_pred_prob_distance[n])):
+                                vsum += batch_pred_prob_distance[n, m] * util.classification2distance(float(m) + 0.5, cfg.n_distances)
+                                wt += batch_pred_prob_distance[n, m]
+                            dist_deg = vsum / wt
+                            #print 'Dist_t/p/pv/l', batch_true_label_distance[n], batch_pred_label_distance[n], dist_deg, metrics_['distance_loss'],
+                            evaluate_results_file.write( 'Dist_t/p/pv/l {:d} {:d} {:.2f} {:.5f}'.format( \
+                                batch_true_label_distance[n], batch_pred_label_distance[n], dist_deg, metrics_['distance_loss']))
+                            if cfg.n_magnitudes > 0:
+                                vsum = 0.0
+                                wt = 0.0
+                                for m in range(len(batch_pred_prob_magnitude[n])):
+                                    vsum += batch_pred_prob_magnitude[n, m] * util.classification2magnitude(float(m) + 0.5, cfg.n_magnitudes)
+                                    wt += batch_pred_prob_magnitude[n, m]
+                                mag = vsum / wt
+                                #print 'Mag_t/p/pv/l', batch_true_label_magnitude[n], batch_pred_label_magnitude[n], mag, metrics_['magnitude_loss'],
+                                evaluate_results_file.write( '  Mag_t/p/pv/l {:d} {:d} {:.2f} {:.5f}'.format( \
+                                    batch_true_label_magnitude[n], batch_pred_label_magnitude[n], mag, metrics_['magnitude_loss']))
+                            if cfg.n_depths > 0:
+                                vsum = 0.0
+                                wt = 0.0
+                                for m in range(len(batch_pred_prob_depth[n])):
+                                    vsum += batch_pred_prob_depth[n, m] * util.classification2depth(float(m) + 0.5, cfg.n_depths)
+                                    wt += batch_pred_prob_depth[n, m]
+                                depth = vsum / wt
+                                #print 'Dep_t/p/pv/l', batch_true_label_depth[n], batch_pred_label_depth[n], depth, metrics_['depth_loss'],
+                                evaluate_results_file.write( '  Dep_t/p/pv/l {:d} {:d} {:.1f} {:.5f}'.format( \
+                                    batch_true_label_depth[n], batch_pred_label_depth[n], depth, metrics_['depth_loss']))
+                            if cfg.n_azimuths > 0:
+                                vsum = 0.0
+                                wt = 0.0
+                                for m in range(len(batch_pred_prob_azimuth[n])):
+                                    vsum += batch_pred_prob_azimuth[n, m] * util.classification2azimuth(float(m) + 0.5, cfg.n_azimuths)
+                                    wt += batch_pred_prob_azimuth[n, m]
+                                azimuth = vsum / wt
+                                #print 'Az_t/p/pv/l', batch_true_label_azimuth[n], batch_pred_label_azimuth[n], azimuth, metrics_['azimuth_loss'],
+                                evaluate_results_file.write( '  Az_t/p/pv/l {:d} {:d} {:.1f} {:.5f}'.format( \
+                                    batch_true_label_azimuth[n], batch_pred_label_azimuth[n], azimuth, metrics_['azimuth_loss']))
+                            evaluate_results_file.write('  {:s}'.format(batch_names[n]))
+                            evaluate_results_file.write('\n')
+                            
+                            # write event results to event directory
+                            if args.save_event_results and batch_true_distance[n] > 0:
+                                fpath, fname = os.path.split(batch_names[n])
+                                event_name = fname.replace('.tfrecords:0', '')
+                                xml_path = os.path.join(fpath, 'xml', event_name + '.xml')
+                                catalog = event.read_events(xml_path, 'QUAKEML')
+                                evt = catalog[0]
+                                origin = evt.preferred_origin()
+                                event_name = origin.time.format_iris_web_service().replace(':', '-')
+                                event_dirname =  os.path.join(event_results_dirname, event_name)
+                                if not os.path.exists(event_dirname):
+                                    os.makedirs(event_dirname)
+                                # save event information
+                                filename = os.path.join(event_dirname, event_name + '.event.xml')
+                                evt.write(filename, format='QUAKEML')  
+                                # write channel event results
+                                net, sta, loc_raw, remainder = fname.split('_')
+                                tokens = remainder.split('.')
+                                chan = tokens[0]
+                                timestr = remainder.replace(chan + '.', '').replace('.tfrecords:0', '')
+                                loc = '-' if loc_raw == '' else loc_raw
+                                # write summary results file
+                                filename = os.path.join(event_dirname, event_name + '.sum.txt')
+                                with open(filename, 'a') as file:
+                                    file.write('{:s} {:s} {:s} {:s} {:s} Dist_t/p {:.2f} {:.2f} Mag_t/p {:.2f} {:.2f} Dep_t/p {:.1f} {:.1f} Az_t/p {:.1f} {:.1f}' \
+                                               .format(net, sta, loc, chan, timestr, \
+                                               batch_true_distance[n], dist_deg, batch_true_magnitude[n], mag, \
+                                               batch_true_depth[n], depth, batch_true_azimuth[n], azimuth))
+                                    file.write('\n')
+                                # write detailed results file
+                                filename = os.path.join(event_dirname, event_name + '.details.txt')
+                                with open(filename, 'a') as file:
+                                    file.write('{:s} {:s} {:s} {:s} {:s} Dist_t/p {:.2f} {:.2f} Mag_t/p {:.2f} {:.2f} Dep_t/p {:.1f} {:.1f} Az_t/p {:.1f} {:.1f}' \
+                                               .format(net, sta, loc, chan, timestr, \
+                                               batch_true_distance[n], dist_deg, batch_true_magnitude[n], mag, \
+                                               batch_true_depth[n], depth, batch_true_azimuth[n], azimuth))
+                                    file.write('\n')
+                                    for vlist in [batch_pred_prob_distance[n], batch_pred_prob_magnitude[n], batch_pred_prob_depth[n], batch_pred_prob_azimuth[n]]:
+                                        for m in range(len(vlist)):
+                                            file.write(' {:.2f}'.format(vlist[m]))
+                                        file.write('\n')
+                                # pickle detailed results
+                                filename_root = event_name + '.' + net + '.' + sta + '.' + loc_raw + '.' + chan + 'Z'
+                                filename = os.path.join(event_dirname, filename_root + '.probs.pkl')
+                                with open(filename, 'w') as file:
+                                    file.write(pickle.dumps(stream_params)) # use `pickle.loads` to do the reverse
+                                    for vlist in [batch_pred_prob_distance[n], batch_pred_prob_magnitude[n], batch_pred_prob_depth[n], batch_pred_prob_azimuth[n]]:
+                                        file.write(pickle.dumps(vlist)) # use `pickle.loads` to do the reverse
+                                # save channel information
+                                chan_inv = inventory_full.select(network=net, station=sta, location=loc_raw, channel=chan + 'Z', time=origin.time)
+                                filename = os.path.join(event_dirname, filename_root +  '.station.xml')
+                                chan_inv.write(filename, format='STATIONXML')
+
+                            #print 'logits', batch_pred_logits[n]
+                            #print 'prob', batch_pred_prob_distance[n]
+                            
+                        for key in metrics:
+                            mean_metrics[key] += cfg.batch_size*metrics_[key]
+                        n_metrics += cfg.batch_size
+
+                        mess = model.validation_metrics_message(metrics_)
+                        # 20180420 AJL print '{:03d} | '.format(n)+mess
+
+                    except KeyboardInterrupt:
+                        print 'stopping evaluation'
+                        break
+
+                    except tf.errors.OutOfRangeError:
+                        print 'Evaluation completed ({} epochs).'.format(cfg.n_epochs)
+                        print '{} windows seen'.format(n_metrics)
+                        break
+                    
+                    
+                evaluate_results_file.close()
+                print 'Evaluation results written to: ', evaluate_results_file_name
+                        
+
+                if n_metrics > 0:
+                  for key in metrics:
+                    mean_metrics[key] /= n_metrics
+                    summary = tf.Summary(value=[tf.Summary.Value(
+                      tag='{}/val'.format(key), simple_value=mean_metrics[key])])
+                    if args.save_summary:
+                        summary_writer.add_summary(summary, global_step=step)
+
+                summary_writer.flush()
+
+                mess = model.validation_metrics_message(mean_metrics)
+                print 'Average | '+mess
+
+                if args.eval_interval < 0 or args.save_event_results:
+                  print 'End of evaluation'
+                  break
+
+            tf.reset_default_graph()
+            print 'Sleeping for {}s'.format(args.eval_interval)
+            time.sleep(args.eval_interval)
+
+        except KeyboardInterrupt:
+            print 'stopping evaluation'
+            break
+
+        finally:
+            print 'joining data threads'
+            coord.request_stop()
+
+
+    if args.save_false:
+        false_preds = {}
+        false_preds['start_time'] = false_start
+        false_preds['end_time'] = false_end
+        false_preds['origintime'] = false_origintime
+        # false_preds = np.array((false_start, false_end)).transpose()[0]
+        # print 'shape', false_preds.shape
+        df =  pd.DataFrame(false_preds) 
+        df.to_csv(os.path.join(false_dir,'false_preds.csv'))
+        
+    if args.save_event_results:
+        return
+
+    pred_labels_distance = pred_labels_distance[1::]
+    true_labels_distance = true_labels_distance[1::]
+     # np.save('output/pred_labels_noise.npy',pred_labels)
+    # np.save('output/true_labels_noise.npy',true_labels)
+    print '---Confusion Matrix Distance----'
+    print confusion_matrix(true_labels_distance, pred_labels_distance)
+    pred_labels_magnitude = pred_labels_magnitude[1::]
+    true_labels_magnitude = true_labels_magnitude[1::]
+    print '---Confusion Matrix Magnitude----'
+    print confusion_matrix(true_labels_magnitude, pred_labels_magnitude)
+    pred_labels_depth = pred_labels_depth[1::]
+    true_labels_depth = true_labels_depth[1::]
+    print '---Confusion Matrix Depth----'
+    print confusion_matrix(true_labels_depth, pred_labels_depth)
+    pred_labels_azimuth = pred_labels_azimuth[1::]
+    true_labels_azimuth = true_labels_azimuth[1::]
+    print '---Confusion Matrix Azimuth----'
+    print confusion_matrix(true_labels_azimuth, pred_labels_azimuth)
+
+    coord.join(threads)
+
+    # if args.save_false:
+    #     false_preds = np.array((false_start, false_end)).transpose()
+    #     df =  pd.Dataframe(false_preds, columns=['start_time, end_time'])
+    #     df.to_csv(os.path.join(false_dir,'false_preds.csv')
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--outpath', type=str, 
+                        help='Path for stream output')
+    parser.add_argument('--dataset', type=str,default=None,
+                        help='path to the records to evaluate')
+    parser.add_argument('--unique_station', type=str, default=None)
+    parser.add_argument('--ndatapoints', type=int, default=-1)
+    parser.add_argument('--channel_file', type=str,
+                        help='File containing FDSNStationXML list of net/station/location/channel to retrieve')
+    parser.add_argument('--checkpoint_dir',default='model/convnetquake',
+                        type=str, help='path to checkpoints directory')
+    parser.add_argument('--step',type=int,default=None,
+                        help='step to load')
+    parser.add_argument('--model',type=str,default='ConvNetQuake',
+                        help='model to load')
+    parser.add_argument('--eval_interval',type=int,default=-1,
+                        help='sleep time between evaluations')
+    parser.add_argument('--save_summary',type=bool,default=True,
+                        help='True to save summary in tensorboard')
+    parser.add_argument('--noise', action='store_true',
+                        help='pass this flag if evaluate acc on noise')
+    parser.set_defaults(noise=False)
+    parser.add_argument('--events', action='store_true',
+                        help='pass this flag if evaluate acc on events')
+    parser.set_defaults(events=True)
+    parser.add_argument('--save_event_results', action='store_true',
+                        help='save detailed even results')
+    parser.set_defaults(save_event_results=False)
+    parser.add_argument('--save_false', action='store_true',
+                        help='pass this flag to save times of false preds')
+    parser.set_defaults(profiling=False)
+    parser.add_argument('--use_magnitudes', action='store_true')
+    parser.set_defaults(use_magnitudes=False)
+    parser.add_argument('--use_depths', action='store_true')
+    parser.set_defaults(use_depths=False)
+    parser.add_argument('--use_azimuths', action='store_true')
+    parser.set_defaults(use_azimuths=False)
+    
+    args = parser.parse_args()
+    main(args)

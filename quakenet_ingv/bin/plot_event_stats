@@ -1,0 +1,253 @@
+#!/usr/bin/env python
+# encoding: utf-8
+# -------------------------------------------------------------------
+# File:  plot_event_results
+# Author: Anthony Lomax <anthony@alomax.net>
+# Created: 2018-05-09
+# ------------------------------------------------------------------#
+
+""" Plot event results on an interactive map"""
+
+# import sys
+import argparse
+import os
+# import shutil
+# import time
+import cPickle as pickle
+
+import math
+import geopy
+
+from obspy.core import event
+import obspy.geodetics.base as geo
+
+import folium
+#from folium.plugins import MarkerCluster
+
+import quakenet.util as util
+import quakenet.plot as qnplot
+
+PROB_CUTOFF = 0.01
+
+
+def get_event_density(sigma, latitude, longitude, origins):
+    
+    two_sigma_sqr =  (2.0 * sigma * sigma)
+    density_sum = 0.0
+    closest = 999.9
+    for origin in origins:
+        dist_meters, azim, bazim = geo.gps2dist_azimuth(latitude, longitude, origin.latitude, origin.longitude)
+        dist = geo.kilometer2degrees(dist_meters / 1000.0, radius=6371)
+        closest = min(closest, dist)
+        weight = math.exp(-(dist * dist) / two_sigma_sqr)  # https://en.wikipedia.org/wiki/Gaussian_blur
+        density_sum += weight
+
+    return density_sum, closest
+    
+
+
+def main(args):
+    
+    # get train events
+    print 'get train events'
+    origins = {}
+    all_origins = []
+    all_origins_ids = []
+    for root, dirs, files in os.walk(args.train_events_path):
+        for f in files:
+            if f.endswith('.xml'):
+#                 if not '_VTS_' in f:    # DEBUG!!!
+#                     continue
+                event_xml_file = f
+                #  MN_PDG__BH.2009.12.17.01.42.47.815.xml
+                values = event_xml_file.split('.')
+                net, sta, loc, chan = values[0].split('_')
+                seed_id = net + '.' + sta + '.' + loc + '.' + chan + 'Z'
+                print event_xml_file + '          \r',
+                events = event.read_events(os.path.join(root, event_xml_file))
+                for evt in events:
+                    if not seed_id in origins.keys():
+                            origins[seed_id] = []
+                    origins[seed_id].append(evt.preferred_origin())
+                    if not str(evt.preferred_origin().resource_id) in all_origins_ids:
+                            all_origins.append(evt.preferred_origin())
+                            all_origins_ids.append(str(evt.preferred_origin().resource_id))
+    print ''
+    
+    # get evaluate event stats
+    print 'get evaluate event stats'
+    data_relative = []
+    data_absolute = []
+    data_relative_closest = []
+    data_absolute_closest = []
+    data_distance = []
+    data_azimuth = []
+    data_epi_sta_stats_relative = []
+    data_epi_sta_stats_absolute = []
+    data_epi_sta_stats_relative_closest = []
+    data_epi_sta_stats_absolute_closest = []
+    data_epi_sta_stats_distance = []
+    SIGMA_DIST_FRACTION = 20.0
+    for root, dirs, files in os.walk(args.evaluate_event_results_path):
+        for f in files:
+            if f.endswith('.epi_sta_stats.pkl'):
+                epi_sta_stats_pkl_file = f
+                print 'Processing:', epi_sta_stats_pkl_file
+                with open(os.path.join(root, epi_sta_stats_pkl_file), 'r') as file:
+                    (origin_latitude, origin_longitude, origin_depth, mean_distance_error, tot_prob_sum, mean_origin_sta_distance, tot_sta_sum) = pickle.load(file)
+
+                    # find training event density around origin
+                    # sigma is 1/20 station-event distance
+                    sigma = mean_origin_sta_distance / SIGMA_DIST_FRACTION
+                    train_event_density, closest = get_event_density(sigma, origin_latitude, origin_longitude, all_origins)
+                    # get measure of distance error
+                    distance_error_relative = mean_distance_error / mean_origin_sta_distance
+                    point_size = tot_prob_sum / float(tot_sta_sum)
+                    #color_value = mean_origin_sta_distance / 90.0
+                    #color_value = min(color_value, 1.0)
+                    color_value = [255, 0, 0]
+                    if (mean_origin_sta_distance < 3.5):
+                        color_value = [0, 127, 0]
+                    elif (mean_origin_sta_distance > 30.0):
+                        color_value = [0, 0, 255]
+#                         print 'DEBUG: ' + str(origin_latitude) + ' '+ str(origin_longitude) + ' den=' + str(train_event_density) + \
+#                             ' prob=' + str(tot_prob) + ' size=' + str(point_size)
+                    data_epi_sta_stats_relative.append([train_event_density, distance_error_relative, point_size, color_value[0], color_value[1], color_value[2]])
+                    data_epi_sta_stats_absolute.append([train_event_density, mean_distance_error, point_size, color_value[0], color_value[1], color_value[2]])
+                    data_epi_sta_stats_relative_closest.append([closest, distance_error_relative, point_size, color_value[0], color_value[1], color_value[2]])
+                    data_epi_sta_stats_absolute_closest.append([closest, mean_distance_error, point_size, color_value[0], color_value[1], color_value[2]])
+                    data_epi_sta_stats_distance.append([mean_origin_sta_distance, mean_distance_error, point_size, color_value[0], color_value[1], color_value[2]])
+            if f.endswith('.epi_sta_poly.pkl'):
+                epi_sta_poly_pkl_file = f
+                print 'Processing:', epi_sta_poly_pkl_file
+                seed_id_last = '$NULL$'
+                train_event_density, closest = (-1.0, -1.0)
+                with open(os.path.join(root, epi_sta_poly_pkl_file), 'r') as file:
+                    epi_sta_poly_coords = pickle.load(file)
+                    for coords in epi_sta_poly_coords:
+                        (origin_latitude, origin_longitude, origin_depth, 
+                                 seed_id, sta_latitude, sta_longitude, 
+                                 lat_cent, lon_cent, tot_prob) = coords
+                        if not seed_id in origins.keys():
+                            print '\nERROR: ' + seed_id + ' not in origins list!\n'
+                            continue
+                        if not seed_id == seed_id_last:
+                            #origin_sta_distance = distance((origin_latitude, origin_longitude), (sta_latitude, sta_longitude)).degrees
+                            dist_meters, azim, bazim = geo.gps2dist_azimuth(origin_latitude, origin_longitude, sta_latitude, sta_longitude)
+                            origin_sta_distance = geo.kilometer2degrees(dist_meters / 1000.0, radius=6371)
+                            # find training event density around origin
+                            # sigma is 1/10 station-event distance
+                            sigma = origin_sta_distance / SIGMA_DIST_FRACTION
+                            train_event_density, closest = get_event_density(sigma, origin_latitude, origin_longitude, origins[seed_id])
+                            seed_id_last = seed_id
+                        # get measure of distance error
+                        #distance_error =distance((origin_latitude, origin_longitude), (lat_cent, lon_cent)).degrees / origin_sta_distance
+                        dist_meters, azim, bazim = geo.gps2dist_azimuth(origin_latitude, origin_longitude, lat_cent, lon_cent)
+                        distance_error = geo.kilometer2degrees(dist_meters / 1000.0, radius=6371)
+                        distance_error_relative = distance_error / origin_sta_distance
+                        #
+                        dist_meters, azim1, bazim = geo.gps2dist_azimuth(sta_latitude, sta_longitude, origin_latitude, origin_longitude)
+                        dist_meters, azim2, bazim = geo.gps2dist_azimuth(sta_latitude, sta_longitude, lat_cent, lon_cent)
+                        azimuth_error = azim2 - azim1
+                        if azimuth_error < -180.0:
+                            azimuth_error += 360
+                        elif azimuth_error > 180.0:
+                            azimuth_error -= 360
+                        #
+                        point_size = tot_prob
+                        #color_value = origin_sta_distance / 90.0
+                        #color_value = min(color_value, 1.0)
+                        color_value = [255, 0, 0]
+                        if (origin_sta_distance < 3.5):
+                            color_value = [0, 127, 0]
+                        elif (origin_sta_distance > 30.0):
+                            color_value = [0, 0, 255]
+#                         print 'DEBUG: ' + str(origin_latitude) + ' '+ str(origin_longitude) + ' den=' + str(train_event_density) + \
+#                             ' prob=' + str(tot_prob) + ' size=' + str(point_size)
+                        data_relative.append([train_event_density, distance_error_relative, point_size, color_value[0], color_value[1], color_value[2]])
+                        data_absolute.append([train_event_density, distance_error, point_size, color_value[0], color_value[1], color_value[2]])
+                        data_relative_closest.append([closest, distance_error_relative, point_size, color_value[0], color_value[1], color_value[2]])
+                        data_absolute_closest.append([closest, distance_error, point_size, color_value[0], color_value[1], color_value[2]])
+                        data_distance.append([origin_sta_distance, distance_error, point_size, color_value[0], color_value[1], color_value[2]])
+                        # azimuth
+                        color_value = [255, 0, 0]
+                        #if (origin_sta_distance < 20.0):
+                        if (origin_sta_distance < 3.5):
+                            color_value = [0, 127, 0]
+                        elif (origin_sta_distance > 80.0):
+                            color_value = [0, 0, 255]
+                        data_azimuth.append([origin_sta_distance, azimuth_error, point_size, color_value[0], color_value[1], color_value[2]])
+    print ''
+    
+    outpath = os.path.join(args.evaluate_event_results_path, 'html')
+    if not os.path.exists(outpath):
+        os.makedirs(outpath)
+        
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_density_relative.html')
+    qnplot.write_scatter_chart_html('distance_error_event_density_relative', 'Distance error vs. Training event density', 
+                                    'Training event density around true epicenter', False, 'Relative distance error ( error / station-event distance)', True, data_relative, htmlfile)
+    print 'HTML written to: ' + htmlfile
+    #
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_density_absolute.html')
+    qnplot.write_scatter_chart_html('distance_error_event_density_absolute', 'Distance error vs. Training event density', 
+                                    'Training event density around true epicenter', False, 'Distance error (degrees)', True, data_absolute, htmlfile)
+    print 'HTML written to: ' + htmlfile
+    #
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_closest_relative.html')
+    qnplot.write_scatter_chart_html('distance_error_event_closest_relative', 'Distance error vs. Training event closest distance', 
+                                    'Training event closest distance to true epicenter (degrees)', True, 'Relative distance error ( error / station-event distance)', True, data_relative_closest, htmlfile)
+    print 'HTML written to: ' + htmlfile
+    #
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_closest_absolute.html')
+    qnplot.write_scatter_chart_html('distance_error_event_closest_absolute', 'Distance error vs. Training event closest distance', 
+                                    'Training event closest distance to true epicenter (degrees)', True, 'Distance error (degrees)', True, data_absolute_closest, htmlfile)
+    print 'HTML written to: ' + htmlfile
+    #
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_distance.html')
+    qnplot.write_scatter_chart_html('distance_error_event_distance', 'Distance error vs. Event distance', 
+                                    'Station-event distance (degrees)', True, 'Distance error (degrees)', True, data_distance, htmlfile)
+    print 'HTML written to: ' + htmlfile
+
+    #
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.azimuth_error_event_distance.html')
+    qnplot.write_scatter_chart_html('azimuth_error_event_distance', 'Azimuth error vs. Event distance', 
+                                    'Station-event distance (degrees)', True, 'Azimuth error (degrees)', True, data_azimuth, htmlfile)
+    print 'HTML written to: ' + htmlfile
+
+
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_density_relative_data_epi_sta_stats.html')
+    qnplot.write_scatter_chart_html('distance_error_event_density_relative', 'Distance error vs. Training event density (event mean over stations)', 
+                                    'Training event density around true epicenter', False, 'Relative distance error ( error / station-event distance)', True, data_epi_sta_stats_relative, htmlfile)
+    print 'HTML written to: ' + htmlfile
+    #
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_density_absolute_data_epi_sta_stats.html')
+    qnplot.write_scatter_chart_html('distance_error_event_density_absolute', 'Distance error vs. Training event density (event mean over stations)', 
+                                    'Training event density around true epicenter', False, 'Distance error (degrees)', True, data_epi_sta_stats_absolute, htmlfile)
+    print 'HTML written to: ' + htmlfile
+    #
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_closest_relative_data_epi_sta_stats.html')
+    qnplot.write_scatter_chart_html('distance_error_event_closest_relative', 'Distance error vs. Training event closest distance (event mean over stations)', 
+                                    'Training event closest distance to true epicenter (degrees)', True, 'Relative distance error ( error / station-event distance)', True, data_epi_sta_stats_relative_closest, htmlfile)
+    print 'HTML written to: ' + htmlfile
+    #
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_closest_absolute_data_epi_sta_stats.html')
+    qnplot.write_scatter_chart_html('distance_error_event_closest_absolute', 'Distance error vs. Training event closest distance (event mean over stations)', 
+                                    'Training event closest distance to true epicenter (degrees)', True, 'Distance error (degrees)', True, data_epi_sta_stats_absolute_closest, htmlfile)
+    print 'HTML written to: ' + htmlfile
+    #
+    htmlfile = os.path.join(args.evaluate_event_results_path, 'html', 'events.distance_error_event_distance_data_epi_sta_stats.html')
+    qnplot.write_scatter_chart_html('distance_error_event_distance', 'Distance error vs. Event distance (event mean over stations)', 
+                                    'Station-event distance (degrees)', True, 'Distance error (degrees)', True, data_epi_sta_stats_distance, htmlfile)
+    print 'HTML written to: ' + htmlfile
+        
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--evaluate_event_results_path', type=str, 
+                        help='Path for evaluated event files input')
+    parser.add_argument('--train_events_path', type=str, 
+                        help='Path for training event files input')
+    
+    args = parser.parse_args()
+    main(args)
