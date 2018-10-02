@@ -10,7 +10,7 @@ Anthony Lomax, Alberto Michelini and Dario Jozinović, 2018. **An investigation
 
 ## Overview
 
-ConvNetQuake_INGV, derived from ConvNetQuake (Perol et al., 2018; http://advances.sciencemag.org/content/4/2/e1700578.full), implements a CNN to detect earthquake events and determine their location and magnitude. ConvNetQuake_INGV is trained through supervised learning using waveform windows containing a diverse set of known event and noise waveforms.
+ConvNetQuake_INGV, derived from ConvNetQuake (Perol et al., 2018; http://advances.sciencemag.org/content/4/2/e1700578.full), implements a CNN to characterize earthquakes at any distance (local to far teleseismic). ConvNetQuake_INGV operates on 50sec, 3-component, broadband, single-station waveforms to detect seismic events and obtain binned, probabilistic estimates of the distance, azimuth, depth and magnitude of the event. ConvNetQuake_INGV is trained through supervised learning using waveform windows containing a diverse set of known event and noise waveforms.
 
 For ConvNetQuake_INGV, we modify the procedures and codes of Perol et al. (2018) and develop new tools to retrieve events, and noise and event waveforms from FDSN web-services (http://www.fdsn.org/webservices).
 
