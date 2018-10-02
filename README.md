@@ -2,7 +2,7 @@
 ## A python package for rapid earthquake characterization using single station waveforms and a convolutional neural network.
 
 
-## Citation:
+## Citation
 We have a manuscript submitted on the development and application of ConvNetQuake_INGV, if you reference or make use of ConvNetQuake_INGV please cite the folloing paper:
 
 Anthony Lomax, Alberto Michelini and Dario Jozinović, 2018. **An investigation of rapid earthquake characterization using single station waveforms and a convolutional neural network**, Seismological Research Letters
@@ -55,7 +55,7 @@ For details see The ConvNetQuake_INGV section below.
     ...
 
 
-## Running examples
+## Run examples
 
     #install
     see INSTALLATION.txt
